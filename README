@@ -1,0 +1,24 @@
+This is an implementation of the rump kernel hypervisor for the Linux
+kernel platform.  The hypervisor allows rump kernels, i.e. essentially
+unmodified NetBSD kernel drivers, to run *in* the Linux kernel.
+
+This is a proof-of-concept implementation, which means that it does not
+do meticulous error checking and robust error handling.  The exception is
+synchronization code, there the implementation is 100% correct and robust
+(warranty does not cover any and all bugs).  Anything short of that would
+lead to unnecessary debugging even in a proof-of-concept demo.
+
+The main purpose of releasing the implementation is for code reading.
+It will work if you want to run it, but I did not clean up the build
+"infrastructure" at all, so you should expect to spend some time tuning
+to make things build.  Then just insmod the resulting kernel module and
+look at it run.  Or, if you want to be really fancy, have the control
+part in a separate module...
+
+For more info on rump kernels, see:
+  http://www.netbsd.org/docs/rump/
+
+For more info on this hypervisor, see:
+  http://blog.netbsd.org/tnf/entry/a_rump_kernel_hypervisor_for
+
+  - pooka@iki.fi
