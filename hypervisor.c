@@ -20,7 +20,7 @@ int
 rumpuser_getversion(void)
 {
 
-	return RUMPUSER_VERSION;
+	return 15;
 }
 
 int
