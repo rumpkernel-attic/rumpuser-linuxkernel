@@ -66,7 +66,7 @@ rumpuser_malloc(size_t len, int alignment)
 	 * which takes alignment as a parameter?
 	 */
 	rv = kmalloc(len, GFP_KERNEL);
-	BUG_ON((uintptr_t)rv & (uintptr_t)(alignment-1));
+	BUG_ON(alignment && ((uintptr_t)rv & (uintptr_t)(alignment-1)));
 	return rv;
 }
 
