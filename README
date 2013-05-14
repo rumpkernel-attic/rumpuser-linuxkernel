@@ -21,4 +21,7 @@ For more info on rump kernels, see:
 For more info on this hypervisor, see:
   http://blog.netbsd.org/tnf/entry/a_rump_kernel_hypervisor_for
 
+For the manual page documenting the hypercall interface, see:
+  http://man.netbsd.org/cgi-bin/man-cgi?rumpuser++NetBSD-current
+
   - pooka@iki.fi
