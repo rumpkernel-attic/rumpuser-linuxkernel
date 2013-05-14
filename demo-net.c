@@ -33,6 +33,7 @@ rumpkern_demo(void)
 
 	/* create interface and configure an address for it */
 	error = rump_pub_netconfig_ifcreate(IFNAME);
+	printk(KERN_INFO "created %s: %d\n", IFNAME, error);
  	error = rump_pub_netconfig_dhcp_ipv4_oneshot(IFNAME);
 	if (error) {
 		printk(KERN_INFO "failed to configure networking %d\n", error);

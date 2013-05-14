@@ -9,6 +9,7 @@
 
 #include <linux/kernel.h>
 #include <linux/delay.h>
+#include <linux/mutex.h>
 #include <linux/random.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
@@ -16,33 +17,44 @@
 
 #include <rump/rumpuser.h>
 
+#include "hypervisor.h"
+
+struct rumpuser_hyperup rumpuser__hyp;
+static struct mutex printmtx;
+
 int
-rumpuser_getversion(void)
+rumpuser_init(int version, const struct rumpuser_hyperup *hyp)
 {
 
-	return 15;
+	if (version != 16)
+		return 1; /* EKERNELMISMATCH */
+
+	mutex_init(&printmtx);
+
+	rumpuser__thrinit();
+	rumpuser__hyp = *hyp;
+
+	return 0;
 }
 
-int
-rumpuser_putchar(int ch, int *error)
+void
+rumpuser_putchar(int ch)
 {
-	/* i am not an atomic playboy */
 	static char buf[1024];
 	static unsigned int bufptr = 0;
 
-	if (ch != '\n') {
+	mutex_lock(&printmtx);
+	if (ch != '\n' && bufptr != sizeof(buf)-1) {
 		buf[bufptr++] = (char)ch;
 	} else {
 		buf[bufptr] = '\0';
 		printk(KERN_INFO "%s\n", buf);
 		bufptr = 0;
 	}
-
-	*error = 0;
-	return 0;
+	mutex_unlock(&printmtx);
 }
 
-int
+void
 rumpuser_dprintf(const char *fmt, ...)
 {
 	va_list ap;
@@ -51,12 +63,10 @@ rumpuser_dprintf(const char *fmt, ...)
 	va_start(ap, fmt);
 	rv = vprintk(fmt, ap);
 	va_end(ap);
-
-	return rv;
 }
 
-void *
-rumpuser_malloc(size_t len, int alignment)
+int
+rumpuser_malloc(size_t len, int alignment, void **retval)
 {
 	void *rv;
 
@@ -67,11 +77,13 @@ rumpuser_malloc(size_t len, int alignment)
 	 */
 	rv = kmalloc(len, GFP_KERNEL);
 	BUG_ON(alignment && ((uintptr_t)rv & (uintptr_t)(alignment-1)));
-	return rv;
+
+	*retval = rv;
+	return rv ? 0 : ENOMEM;
 }
 
 void
-rumpuser_free(void *addr)
+rumpuser_free(void *addr, size_t len)
 {
 
 	kfree(addr);
@@ -95,82 +107,83 @@ static struct {
 	const char *name;
 	const char *value;
 } envtab[] = {
+	{ RUMPUSER_PARAM_NCPU, "4" }, /* default to 4 CPUs ... just for fun */
+	{ RUMPUSER_PARAM_HOSTNAME, "rump-in-the-kernel" },
 	{ "RUMP_VERBOSE", "1" },
-	{ "RUMP_NCPU", "4" }, /* default to 4 CPUs ... just for fun */
 	{ NULL, NULL },
 };
 
 int
-rumpuser_getenv(const char *name, char *buf, size_t blen, int *error)
+rumpuser_getparam(const char *name, void *buf, size_t blen)
 {
 	int i;
 
 	for (i = 0; envtab[i].name; i++) {
 		if (strcmp(name, envtab[i].name) == 0) {
 			if (blen < strlen(envtab[i].value)+1) {
-				*error = 11;
-				return -1;
+				return 11;
 			} else {
 				strcpy(buf, envtab[i].value);
-				*error = 0;
 				return 0;
 			}
 		}
 	}
 
-	*error = 375; /* yes, perfect error number */
-        return -1;
+        return 37;
 }
 
 int
-rumpuser_getnhostcpu(void)
-{
-
-	/* this works better than "0" in my original version ... ;) */
-	return 1;
-}
-
-int
-rumpuser_gethostname(char *name, size_t namelen, int *error)
-{
-
-	snprintf(name, namelen, "rump-in-the-kernel");
-	*error = 0;
-	return 0;
-}
-
-int
-rumpuser_gettime(uint64_t *sec, uint64_t *nsec, int *error)
+rumpuser_clock_gettime(enum rumpclock clk, int64_t *sec, long *nsec)
 {
 	struct timespec ts;
 
 	ts = current_kernel_time();
 	*sec = ts.tv_sec;
 	*nsec = ts.tv_nsec;
-	*error = 0;
 
 	return 0;
 }
 
-uint32_t
-rumpuser_arc4random(void)
+/* hmm, is there an absolute sleep in the linux kernel? */
+int
+rumpuser_clock_sleep(enum rumpclock clk, int64_t sec, long nsec)
 {
-	uint32_t r;
+	struct timespec rqt;
+	struct timespec ctime, delta;
+	unsigned long timo;
 
-	get_random_bytes(&r, sizeof(r));
-	return r;
+	rqt.tv_sec = sec;
+	rqt.tv_nsec = nsec;
+
+	switch (clk) {
+	case RUMPUSER_CLOCK_RELWALL:
+		timo = timespec_to_jiffies(&rqt);
+		break;
+	case RUMPUSER_CLOCK_ABSMONO:
+		ctime = current_kernel_time();
+		delta = timespec_sub(rqt, ctime);
+		if (!timespec_valid(&delta))
+			goto out;
+		timo = timespec_to_jiffies(&delta);
+		break;
+	default:	
+		panic("unreachable");
+	}
+
+	set_current_state(TASK_UNINTERRUPTIBLE);
+	KLOCK_WRAP(schedule_timeout(timo));
+
+ out:
+	return 0;
 }
 
-/* the kernel is statically linked, so no dynlibs tricks necessary here */
-void
-rumpuser_dl_bootstrap(rump_modinit_fn domodinit,
-	rump_symload_fn symload, rump_compload_fn compload)
+int
+rumpuser_getrandom(void *buf, size_t buflen, int flags, size_t *retval)
 {
-	extern void *__start_link_set_rump_components;
-	extern void *__stop_link_set_rump_components;
-	void **rc = &__start_link_set_rump_components;
-	void **rc_end = &__stop_link_set_rump_components;
 
-	for (; rc < rc_end; rc++)
-		compload(*rc);
+	/* XXX: flags not handled */
+	get_random_bytes(buf, buflen);
+	*retval = buflen;
+
+	return 0;
 }

@@ -12,10 +12,13 @@ static struct work_struct demowrk;
 int
 init_module(void)
 {
+	int rv;
 
 	printk(KERN_INFO "initiating rump kernel bootstrap\n");
-	rump_init();
-	printk(KERN_INFO "rump kernel bootstrap complete, scheduling demo\n");
+	rv = rump_init();
+	printk(KERN_INFO "rump kernel bootstrap complete (%d), "
+	    "scheduling demo\n", rv);
+	BUG_ON(rv != 0);
 
 	INIT_WORK(&demowrk, rumpkern_demo);
 	schedule_work(&demowrk);

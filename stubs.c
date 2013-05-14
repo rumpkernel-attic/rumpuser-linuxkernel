@@ -21,6 +21,7 @@ NOTHINGALIAS(rumpuser_daemonize_begin);
 NOTHINGALIAS(rumpuser_daemonize_done);
 
 /* not needed with static linking */
+NOTHINGALIAS(rumpuser_dl_bootstrap);
 NOTHINGALIAS(rumpuser_dl_globalsym);
 
 /* no sysproxy */
@@ -36,19 +37,10 @@ NOTHINGALIAS(rumpuser_sp_raise);
 /* for host I/O, we don't use it */
 NOTHINGALIAS(rumpuser_open);
 NOTHINGALIAS(rumpuser_close);
-NOTHINGALIAS(rumpuser_read_bio);
-NOTHINGALIAS(rumpuser_write_bio);
-NOTHINGALIAS(rumpuser_pread);
-NOTHINGALIAS(rumpuser_pwrite);
+NOTHINGALIAS(rumpuser_bio);
+NOTHINGALIAS(rumpuser_iovread);
+NOTHINGALIAS(rumpuser_iovwrite);
 NOTHINGALIAS(rumpuser_getfileinfo);
-NOTHINGALIAS(rumpuser_fsync);
-NOTHINGALIAS(rumpuser_memsync);
-NOTHINGALIAS(rumpuser_filemmap);
-NOTHINGALIAS(rumpuser_aios);
-NOTHINGALIAS(rumpuser_aio_cv);
-NOTHINGALIAS(rumpuser_aio_mtx);
-NOTHINGALIAS(rumpuser_aio_head);
-NOTHINGALIAS(rumpuser_aio_tail);
 
 /* must succeed *if* called (we make it so that they aren't called) */
 PANICALIAS(rumpuser_anonmmap);

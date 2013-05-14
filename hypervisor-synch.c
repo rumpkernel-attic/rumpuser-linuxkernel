@@ -24,17 +24,17 @@
 struct rumpuser_mtx {
 	struct mutex lkmtx;
 	struct lwp *owner;
-	int iskmutex;
+	int flags;
 };
 
-#define RURW_AMWRITER(rw) (rw->writer == rumpuser_get_curlwp()		\
+#define RURW_AMWRITER(rw) (rw->writer == rumpuser_curlwp()		\
 				&& atomic_read(&rw->readers) == -1)
 #define RURW_HASREAD(rw)  (atomic_read(&rw->readers) > 0)
 
 #define RURW_SETWRITE(rw)						\
 do {									\
 	BUG_ON(atomic_read(&rw->readers) != 0);				\
-	rw->writer = rumpuser_get_curlwp();				\
+	rw->writer = rumpuser_curlwp();				\
 	atomic_set(&rw->readers, -1);					\
 } while (/*CONSTCOND*/0)
 #define RURW_CLRWRITE(rw)						\
@@ -59,31 +59,27 @@ struct rumpuser_rw {
 	struct lwp *writer;
 };
 
-kernel_lockfn	rumpuser__klock;
-kernel_unlockfn	rumpuser__kunlock;
-int		rumpuser__wantthreads;
-
 static struct mutex curlwpmtx;
 
 void
-rumpuser_thrinit(kernel_lockfn lockfn, kernel_unlockfn unlockfn, int threads)
+rumpuser__thrinit(void)
 {
-
-	rumpuser__klock = lockfn;
-	rumpuser__kunlock = unlockfn;
-	rumpuser__wantthreads = threads;
 
 	mutex_init(&curlwpmtx);
 }
 
 int
 rumpuser_thread_create(void *(*f)(void *), void *arg, const char *thrname,
-	int joinable, void **ptcookie)
+	int joinable, int priority, int cpuidx, void **ptcookie)
 {
 	struct task_struct *newtsk;
+	char thrbuf[128];
+
+	/* put thread into their own namespace to avoid collisions */
+	snprintf(thrbuf, sizeof(thrbuf), "rump-%s", thrname);
 
 	/* cast ok, we don't care about rv (at least not for now) */
-	newtsk = kthread_run((int (*)(void *))f, arg, thrname);
+	newtsk = kthread_run((int (*)(void *))f, arg, thrbuf);
 	if (newtsk == ERR_PTR(-ENOMEM))
 		return ENOMEM;
 	if (joinable) {
@@ -95,42 +91,36 @@ rumpuser_thread_create(void *(*f)(void *), void *arg, const char *thrname,
 }
 
 void
-rumpuser_mutex_init(struct rumpuser_mtx **mtxp)
+rumpuser_mutex_init(struct rumpuser_mtx **mtxp, int flags)
 {
 	struct rumpuser_mtx *mtx;
 
 	mtx = kmalloc(sizeof(struct rumpuser_mtx), GFP_KERNEL);
+	BUG_ON(!mtx);	
 
 	mutex_init(&mtx->lkmtx);
 	mtx->owner = NULL;
-	mtx->iskmutex = 0;
+	mtx->flags = flags;
+
 	*mtxp = mtx;
-}
-
-void
-rumpuser_mutex_init_kmutex(struct rumpuser_mtx **mtx)
-{
-
-	rumpuser_mutex_init(mtx);
-	(*mtx)->iskmutex = 1;
 }
 
 static void
 mtxenter(struct rumpuser_mtx *mtx)
 {
 
-	if (!mtx->iskmutex)
+	if (!(mtx->flags & RUMPUSER_MTX_KMUTEX))
 		return;
 
 	BUG_ON(mtx->owner);
-	mtx->owner = rumpuser_get_curlwp();
+	mtx->owner = rumpuser_curlwp();
 }
 
 static void
 mtxexit(struct rumpuser_mtx *mtx)
 {
 
-	if (!mtx->iskmutex)
+	if (!(mtx->flags & RUMPUSER_MTX_KMUTEX))
 		return;
 
 	BUG_ON(!mtx->owner);
@@ -141,6 +131,11 @@ void
 rumpuser_mutex_enter(struct rumpuser_mtx *mtx)
 {
 
+	if (mtx->flags & RUMPUSER_MTX_SPIN) {
+		rumpuser_mutex_enter_nowrap(mtx);
+		return;
+	}
+
 	if (mutex_trylock(&mtx->lkmtx) == 0)
 		KLOCK_WRAP(mutex_lock(&mtx->lkmtx));
 	mtxenter(mtx);
@@ -150,6 +145,7 @@ void
 rumpuser_mutex_enter_nowrap(struct rumpuser_mtx *mtx)
 {
 
+	BUG_ON(!(mtx->flags & RUMPUSER_MTX_SPIN));
 	mutex_lock(&mtx->lkmtx);
 	mtxenter(mtx);
 }
@@ -164,7 +160,7 @@ rumpuser_mutex_tryenter(struct rumpuser_mtx *mtx)
 		mtxenter(mtx);
 	}
 
-	return rv != 0;
+	return rv ? 0 : EBUSY;
 }
 
 void
@@ -183,12 +179,12 @@ rumpuser_mutex_destroy(struct rumpuser_mtx *mtx)
 	kfree(mtx);
 }
 
-struct lwp *
-rumpuser_mutex_owner(struct rumpuser_mtx *mtx)
+void
+rumpuser_mutex_owner(struct rumpuser_mtx *mtx, struct lwp **owner)
 {
 
-	BUG_ON(!mtx->iskmutex);
-	return mtx->owner;
+	BUG_ON(!(mtx->flags & RUMPUSER_MTX_KMUTEX));
+	*owner = mtx->owner;
 }
 
 void
@@ -202,36 +198,62 @@ rumpuser_rw_init(struct rumpuser_rw **rw)
 }
 
 void
-rumpuser_rw_enter(struct rumpuser_rw *rw, int iswrite)
+rumpuser_rw_enter(struct rumpuser_rw *rw, const enum rumprwlock lk)
 {
 
-	if (iswrite) {
+	switch (lk) {
+	case RUMPUSER_RW_WRITER:
 		if (!write_trylock(&rw->lkrw))
 			KLOCK_WRAP(write_lock(&rw->lkrw));
 		RURW_SETWRITE(rw);
-	} else {
+		break;
+
+	case RUMPUSER_RW_READER:
 		if (!read_trylock(&rw->lkrw))
 			KLOCK_WRAP(read_lock(&rw->lkrw));
 		RURW_INCREAD(rw);
+		break;
 	}
 }
 
 int
-rumpuser_rw_tryenter(struct rumpuser_rw *rw, int iswrite)
+rumpuser_rw_tryenter(struct rumpuser_rw *rw, const enum rumprwlock lk)
 {
-	int rv;
+	int rv = 0;
 
-	if (iswrite) {
+	switch (lk) {
+	case RUMPUSER_RW_WRITER:
 		rv = write_trylock(&rw->lkrw);
 		if (rv)
 			RURW_SETWRITE(rw);
-	} else {
+		break;
+	case RUMPUSER_RW_READER:
 		rv = read_trylock(&rw->lkrw);
 		if (rv)
 			RURW_INCREAD(rw);
+		break;
 	}
 
-	return rv;
+	return rv ? 0 : EBUSY;
+}
+
+int
+rumpuser_rw_tryupgrade(struct rumpuser_rw *rw)
+{
+
+	return EBUSY;
+}
+
+void
+rumpuser_rw_downgrade(struct rumpuser_rw *rw)
+{
+
+	/*
+	 * XXX: wrong, but it'll do for now.  see hypervisor in NetBSD
+	 * for how to emulate this properly.
+	 */
+	rumpuser_rw_exit(rw);
+	KLOCK_WRAP(rumpuser_rw_enter(rw, RUMPUSER_RW_READER));
 }
 
 void
@@ -257,25 +279,18 @@ rumpuser_rw_destroy(struct rumpuser_rw *rw)
 	kfree(rw);
 }
 
-int
-rumpuser_rw_held(struct rumpuser_rw *rw)
+void
+rumpuser_rw_held(struct rumpuser_rw *rw, const enum rumprwlock lk, int *rv)
 {
 
-	return atomic_read(&rw->readers) != 0;
-}
-
-int
-rumpuser_rw_rdheld(struct rumpuser_rw *rw)
-{
-
-	return RURW_HASREAD(rw);
-}
-
-int
-rumpuser_rw_wrheld(struct rumpuser_rw *rw)
-{
-
-	return RURW_AMWRITER(rw);
+	switch (lk) {
+	case RUMPUSER_RW_WRITER:
+		*rv = RURW_AMWRITER(rw);
+		break;
+	case RUMPUSER_RW_READER:
+		*rv = RURW_HASREAD(rw);
+		break;
+	}
 }
 
 /*
@@ -288,13 +303,6 @@ rumpuser_rw_wrheld(struct rumpuser_rw *rw)
  * condition variables with a song and dance of waits and queues.
  * We _almost_ get away with using completitions, but using them leads
  * to races with the timedwait variant... duh.
- *
- * NOTE:
- * At least in the theory the caller is supposed to hold the interlock
- * both when calling wait and wakeup, but on the wait side we cannot
- * assert that the lock is held.  I have a nagging feeling that not all
- * callers actually hold the interlock, but let's use the "pipo silmille
- * ja meno-x" approach to development for now.
  */
 struct waitobj {
 	struct list_head entry;
@@ -303,6 +311,7 @@ struct waitobj {
 };
 
 struct rumpuser_cv {
+	spinlock_t slock;
 	struct list_head waiters;
 	int nwaiters;
 };
@@ -314,7 +323,9 @@ addwaiter(struct rumpuser_cv *cv, struct waitobj *wo)
 	init_waitqueue_head(&wo->wq);
 	wo->wakeupdone = false;
 	cv->nwaiters++;
+	spin_lock(&cv->slock);
 	list_add_tail(&wo->entry, &cv->waiters);
+	spin_unlock(&cv->slock);
 }
 
 /*
@@ -328,11 +339,13 @@ static void
 rmwaiter(struct rumpuser_cv *cv, struct waitobj *wo)
 {
 
+	spin_lock(&cv->slock);
 	if (!wo->wakeupdone) {
 		list_del(&wo->entry);
 		cv->nwaiters--;
 		wo->wakeupdone = true;
 	}
+	spin_unlock(&cv->slock);
 }
 
 void
@@ -343,14 +356,15 @@ rumpuser_cv_init(struct rumpuser_cv **cvp)
 	cv = kmalloc(sizeof(struct rumpuser_cv), GFP_KERNEL);
 	INIT_LIST_HEAD(&cv->waiters);
 	cv->nwaiters = 0;
+	spin_lock_init(&cv->slock);
 	*cvp = cv;
 }
 
-int
-rumpuser_cv_has_waiters(struct rumpuser_cv *cv)
+void
+rumpuser_cv_has_waiters(struct rumpuser_cv *cv, int *rv)
 {
 
-	return cv->nwaiters;
+	*rv = cv->nwaiters;
 }
 
 void
@@ -361,19 +375,37 @@ rumpuser_cv_destroy(struct rumpuser_cv *cv)
 	kfree(cv);
 }
 
+static void
+cv_resched(struct rumpuser_mtx *mtx, int nlocks)
+{
+
+	/*
+	 * uuh.  I guess another mutex flag to make this more obvious.
+	 * See the verbose comment in NetBSD lib/librumpuser for more info
+	 */
+	if ((mtx->flags & (RUMPUSER_MTX_KMUTEX | RUMPUSER_MTX_SPIN)) ==
+	    (RUMPUSER_MTX_KMUTEX | RUMPUSER_MTX_SPIN)) {
+		rumpkern_sched(nlocks, mtx);
+		rumpuser_mutex_enter_nowrap(mtx);
+	} else {
+		mutex_lock(&mtx->lkmtx);
+		mtxenter(mtx);
+		rumpkern_sched(nlocks, mtx);
+	}
+}
+
 void
 rumpuser_cv_wait(struct rumpuser_cv *cv, struct rumpuser_mtx *mtx)
 {
 	struct waitobj wo;
 	int nlocks;
 
-	rumpuser__kunlock(0, &nlocks, mtx);
+	rumpkern_unsched(&nlocks, mtx);
 	addwaiter(cv, &wo);
 	rumpuser_mutex_exit(mtx);
 	wait_event(wo.wq, wo.wakeupdone);
-	rumpuser_mutex_enter_nowrap(mtx);
+	cv_resched(mtx, nlocks);
 	BUG_ON(!wo.wakeupdone);
-	rumpuser__klock(nlocks, mtx);
 }
 
 void
@@ -393,28 +425,23 @@ rumpuser_cv_timedwait(struct rumpuser_cv *cv, struct rumpuser_mtx *mtx,
 	int64_t sec, int64_t nsec)
 {
 	struct waitobj wo;
-	struct timespec ts, tss, tsd;
+	struct timespec ts;
 	unsigned long timo;
 	int rv, nlocks;
 
-	rumpuser__kunlock(0, &nlocks, mtx);
+	rumpkern_unsched(&nlocks, mtx);
 	addwaiter(cv, &wo);
 	rumpuser_mutex_exit(mtx);
 
-	tss = current_kernel_time();
-	ts.tv_sec = sec; ts.tv_nsec = nsec;
-	tsd = timespec_sub(ts, tss);
-	if (tsd.tv_sec < 0)
-		timo = 0;
-	else
-		timo = timespec_to_jiffies(&tsd);
+	ts.tv_sec = sec;
+	ts.tv_nsec = nsec;
+	timo = timespec_to_jiffies(&ts);
 
 	rv = wait_event_timeout(wo.wq, wo.wakeupdone, timo);
-	rumpuser_mutex_enter_nowrap(mtx);
+	cv_resched(mtx, nlocks);
 	rmwaiter(cv, &wo);
-	rumpuser__klock(nlocks, mtx);
 
-	return rv == 0;
+	return rv == 0 ? EWOULDBLOCK : 0;
 }
 
 void
@@ -453,7 +480,7 @@ rumpuser_biothread(void *arg)
 {
         int nlocks;
 
-        rumpuser__kunlock(0, &nlocks, NULL);
+        rumpkern_unsched(&nlocks, NULL);
 	set_current_state(TASK_INTERRUPTIBLE);
 	for (;;)
 		schedule_timeout(MAX_SCHEDULE_TIMEOUT);
@@ -470,82 +497,87 @@ rumpuser_biothread(void *arg)
  */
 
 /* yea, i said "hashing" ;) */
-#define MAXTASK 64
-static struct {
+#define MAXTASK 256
+static struct tasklwp {
 	struct task_struct *tsk;
 	struct lwp *tsklwp;
 } lwps[MAXTASK];
-
-static struct lwp *
-curlwp_l(void)
-{
-	struct task_struct *tsk = current;
-	int i;
-
-	for (i = 0; i < MAXTASK; i++) {
-		if (lwps[i].tsk == tsk) {
-			return lwps[i].tsklwp;
-		}
-	}
-	return NULL;
-}
 
 /*
  * l != NULL: set current task (must not be set)
  * l == NULL: unset current task (must be set)
  */
 void
-rumpuser_set_curlwp(struct lwp *l)
+rumpuser_curlwpop(enum rumplwpop op, struct lwp *l)
 {
-	struct task_struct *cmp, *set;
+	struct task_struct *cur;
+	struct tasklwp *t;
 	int i;
 
-	cmp = l ? NULL : current;
-	set = l ? current : NULL;
-
-	mutex_lock(&curlwpmtx);
-	BUG_ON(curlwp_l() != NULL && l != NULL);
-	BUG_ON(curlwp_l() == NULL && l == NULL);
-	for (i = 0; i < MAXTASK; i++) {
-		if (lwps[i].tsk == cmp) {
-			lwps[i].tsk = set;
-			lwps[i].tsklwp = l;
-			break;
+	switch (op) {
+	case RUMPUSER_LWP_CREATE:
+		mutex_lock(&curlwpmtx);
+		for (i = 0; i < MAXTASK; i++) {
+			BUG_ON(lwps[i].tsklwp == l); /* half-way assert ... */
+			if (lwps[i].tsklwp == NULL) {
+				lwps[i].tsklwp = l;
+				break;
+			}
 		}
+		if (i == MAXTASK)
+			panic("i can't do it captain, i need more tasks!");
+		mutex_unlock(&curlwpmtx);
+		break;
+	case RUMPUSER_LWP_DESTROY:
+		mutex_lock(&curlwpmtx);
+		for (i = 0; i < MAXTASK; i++) {
+			if (lwps[i].tsklwp == l)
+				break;
+		}
+		BUG_ON(i == MAXTASK);
+		lwps[i].tsklwp = NULL;
+		mutex_unlock(&curlwpmtx);
+		break;
+	case RUMPUSER_LWP_SET:
+		/* no need to lock, current & l are guaranteed to be stable */
+		t = NULL;
+		cur = current;
+		if (l) {
+			for (i = 0; i < MAXTASK; i++) {
+				if (lwps[i].tsklwp == l) {
+					t = &lwps[i];
+					break;
+				}
+			}
+			BUG_ON(!t);
+			BUG_ON(t->tsk != NULL);
+			t->tsk = cur;
+		} else {
+			for (i = 0; i < MAXTASK; i++) {
+				if (lwps[i].tsk == cur) {
+					t = &lwps[i];
+					break;
+				}
+			}
+			BUG_ON(!t);
+			BUG_ON(t->tsk == NULL);
+			t->tsk = NULL;
+		}
+		break;
 	}
-	mutex_unlock(&curlwpmtx);
-	BUG_ON(i == MAXTASK);
 }
 
 struct lwp *
-rumpuser_get_curlwp(void)
+rumpuser_curlwp(void)
 {
-	struct lwp *l = NULL;
+	struct task_struct *cur = current;
+	int i;
 
-	mutex_lock(&curlwpmtx);
-	l = curlwp_l();
-	mutex_unlock(&curlwpmtx);
-
-	return l;
-}
-
-int
-rumpuser_nanosleep(uint64_t *sec, uint64_t *nsec, int *error)
-{
-	struct timespec rqt;
-	unsigned long timo;
-
-	rqt.tv_sec = *sec;
-	rqt.tv_nsec = *nsec;
-	timo = timespec_to_jiffies(&rqt);
-
-	set_current_state(TASK_UNINTERRUPTIBLE);
-	KLOCK_WRAP(schedule_timeout(timo));
-
-	/* weeeeell ... */
-	*sec = 0;
-	*nsec = 0;
-
-	*error = 0;
-	return 0;
+	/* no need to lock, tsk is stable here */
+	for (i = 0; i < MAXTASK; i++) {
+		if (lwps[i].tsk == cur) {
+			return lwps[i].tsklwp;
+		}
+	}
+	return NULL;
 }

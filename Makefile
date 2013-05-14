@@ -1,5 +1,5 @@
 obj-m += rumpkern.o
-ccflags-y := -I/home/pooka/rump/include -DLIBRUMPUSER
+ccflags-y := -I/home/pooka/rump/include -DLIBRUMPUSER -I/home/pooka/buildrump.sh/src/sys/rump/net/lib/libvirtif -g
 basesrc= main.o stubs.o hypervisor.o hypervisor-synch.o
 
 # choose your line, choose your fate

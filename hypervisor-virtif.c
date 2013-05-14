@@ -25,15 +25,8 @@ struct virtif_user {
 	struct file *tapfile;
 };
 
-/* a long time ago in a source tree far far away */
-struct virtif_user *rumpcomp_virtif_create(int);
-void rumpcomp_virtif_dying(struct virtif_user *);
-void rumpcomp_virtif_destroy(struct virtif_user *);
-void    rumpcomp_virtif_send(struct virtif_user *, struct iovec *, size_t);
-ssize_t rumpcomp_virtif_recv(struct virtif_user *, void *, size_t);
-
-struct virtif_user *
-rumpcomp_virtif_create(int num)
+int
+rumpcomp_virtif_create(int num, struct virtif_user **vup)
 {
 	struct virtif_user *vu;
 	struct file *filp;
@@ -59,7 +52,9 @@ rumpcomp_virtif_create(int num)
 
 	vu = kmalloc(sizeof(*vu), GFP_KERNEL);
 	vu->tapfile = filp;
-	return vu;
+	*vup = vu;
+
+	return 0;
 }
 
 void
@@ -76,8 +71,9 @@ rumpcomp_virtif_send(struct virtif_user *vu, struct iovec *iov, size_t niov)
 	set_fs(oseg);
 }
 
-ssize_t
-rumpcomp_virtif_recv(struct virtif_user *vu, void *buf, size_t buflen)
+int
+rumpcomp_virtif_recv(struct virtif_user *vu, void *buf, size_t buflen,
+	size_t *recvd)
 {
 	mm_segment_t oseg;
 	loff_t off = 0;
@@ -88,5 +84,9 @@ rumpcomp_virtif_recv(struct virtif_user *vu, void *buf, size_t buflen)
 	KLOCK_WRAP(nn = vfs_read(vu->tapfile, buf, buflen, &off));
 	set_fs(oseg);
 
-	return nn;
+	if (nn < 0)
+		return (int)(-nn);
+	*recvd = (size_t)nn;
+
+	return 0;
 }
