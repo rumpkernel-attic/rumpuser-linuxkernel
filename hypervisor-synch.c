@@ -198,8 +198,9 @@ rumpuser_rw_init(struct rumpuser_rw **rw)
 }
 
 void
-rumpuser_rw_enter(struct rumpuser_rw *rw, const enum rumprwlock lk)
+rumpuser_rw_enter(int enum_rumprwlock, struct rumpuser_rw *rw)
 {
+	enum rumprwlock lk = enum_rumprwlock;
 
 	switch (lk) {
 	case RUMPUSER_RW_WRITER:
@@ -217,8 +218,9 @@ rumpuser_rw_enter(struct rumpuser_rw *rw, const enum rumprwlock lk)
 }
 
 int
-rumpuser_rw_tryenter(struct rumpuser_rw *rw, const enum rumprwlock lk)
+rumpuser_rw_tryenter(int enum_rumprwlock, struct rumpuser_rw *rw)
 {
+	enum rumprwlock lk = enum_rumprwlock;
 	int rv = 0;
 
 	switch (lk) {
@@ -253,7 +255,7 @@ rumpuser_rw_downgrade(struct rumpuser_rw *rw)
 	 * for how to emulate this properly.
 	 */
 	rumpuser_rw_exit(rw);
-	KLOCK_WRAP(rumpuser_rw_enter(rw, RUMPUSER_RW_READER));
+	KLOCK_WRAP(rumpuser_rw_enter(RUMPUSER_RW_READER, rw));
 }
 
 void
@@ -280,8 +282,9 @@ rumpuser_rw_destroy(struct rumpuser_rw *rw)
 }
 
 void
-rumpuser_rw_held(struct rumpuser_rw *rw, const enum rumprwlock lk, int *rv)
+rumpuser_rw_held(int enum_rumprwlock, struct rumpuser_rw *rw, int *rv)
 {
+	enum rumprwlock lk = enum_rumprwlock;
 
 	switch (lk) {
 	case RUMPUSER_RW_WRITER:
@@ -508,9 +511,9 @@ static struct tasklwp {
  * l == NULL: unset current task (must be set)
  */
 void
-rumpuser_curlwpop(enum rumplwpop op, struct lwp *l)
+rumpuser_curlwpop(int enum_rumplwpop, struct lwp *l)
 {
-	struct task_struct *cur;
+	enum rumplwpop op = enum_rumplwpop;
 	struct tasklwp *t;
 	int i;
 
@@ -539,28 +542,19 @@ rumpuser_curlwpop(enum rumplwpop op, struct lwp *l)
 		mutex_unlock(&curlwpmtx);
 		break;
 	case RUMPUSER_LWP_SET:
+	case RUMPUSER_LWP_CLEAR:
 		/* no need to lock, current & l are guaranteed to be stable */
-		t = NULL;
-		cur = current;
-		if (l) {
-			for (i = 0; i < MAXTASK; i++) {
-				if (lwps[i].tsklwp == l) {
-					t = &lwps[i];
-					break;
-				}
+		for (t = NULL, i = 0; i < MAXTASK; i++) {
+			if (lwps[i].tsklwp == l) {
+				t = &lwps[i];
+				break;
 			}
-			BUG_ON(!t);
-			BUG_ON(t->tsk != NULL);
-			t->tsk = cur;
+		}
+		if (op == RUMPUSER_LWP_SET) {
+			BUG_ON(!t || t->tsk != NULL);
+			t->tsk = current;
 		} else {
-			for (i = 0; i < MAXTASK; i++) {
-				if (lwps[i].tsk == cur) {
-					t = &lwps[i];
-					break;
-				}
-			}
-			BUG_ON(!t);
-			BUG_ON(t->tsk == NULL);
+			BUG_ON(!t || t->tsk == NULL);
 			t->tsk = NULL;
 		}
 		break;

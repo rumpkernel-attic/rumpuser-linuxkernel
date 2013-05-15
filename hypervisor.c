@@ -26,7 +26,7 @@ int
 rumpuser_init(int version, const struct rumpuser_hyperup *hyp)
 {
 
-	if (version != 16)
+	if (version != 17)
 		return 1; /* EKERNELMISMATCH */
 
 	mutex_init(&printmtx);
@@ -133,7 +133,7 @@ rumpuser_getparam(const char *name, void *buf, size_t blen)
 }
 
 int
-rumpuser_clock_gettime(enum rumpclock clk, int64_t *sec, long *nsec)
+rumpuser_clock_gettime(int enum_rumpclock, int64_t *sec, long *nsec)
 {
 	struct timespec ts;
 
@@ -146,8 +146,9 @@ rumpuser_clock_gettime(enum rumpclock clk, int64_t *sec, long *nsec)
 
 /* hmm, is there an absolute sleep in the linux kernel? */
 int
-rumpuser_clock_sleep(enum rumpclock clk, int64_t sec, long nsec)
+rumpuser_clock_sleep(int enum_rumpclock, int64_t sec, long nsec)
 {
+	enum rumpclock clk = enum_rumpclock;
 	struct timespec rqt;
 	struct timespec ctime, delta;
 	unsigned long timo;
